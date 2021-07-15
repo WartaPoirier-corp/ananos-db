@@ -1,0 +1,7 @@
+[workspace]
+
+members = [
+    "adb",
+    "adb-show",
+    "adb-merge",
+]

@@ -1,0 +1,10 @@
+[package]
+name = "adb"
+version = "0.1.0"
+authors = ["Ana Gelez <ana@gelez.xyz>"]
+edition = "2018"
+
+[features]
+no_std = []
+
+[dependencies]
