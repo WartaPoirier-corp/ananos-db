@@ -17,6 +17,7 @@ pub enum Error {
     ReadError,
     WriteError,
     MissingTypeInfo(TypeId),
+    NoSpaceLeft,
 }
 
 pub trait Io: core::fmt::Debug {
@@ -43,7 +44,7 @@ pub struct Block {
 }
 
 impl Block {
-    fn iter(self: Arc<Self>) -> BlockIterator {
+    fn iter(&self) -> BlockIterator {
         BlockIterator {
             buffer: self.buffer.clone(),
             item_count: u64::from_be_bytes(self.buffer[0..8].try_into().unwrap()),
@@ -92,11 +93,13 @@ impl<'a> Iterator for BlockIterator {
 pub struct Db<I: Io> {
     block_count: u64,
     block_size: u64,
-    blocks_cache: BTreeMap<u64, Arc<Block>>,
+    blocks_cache: BTreeMap<u64, Block>,
     type_cache: BTreeMap<TypeId, Arc<TypeInfo>>,
     type_table: Vec<TypeId>,
     io: I,
 }
+
+const HEADER_SIZE: u64 = 2 + 6 + 8 + 8 + 64;
 
 impl<I: Io> Db<I> {
     pub fn read_from(mut io: I) -> Result<Self, Error> {
@@ -202,7 +205,7 @@ impl<I: Io> Db<I> {
         Ok(db)
     }
 
-    fn get_type_info(&mut self, ty: TypeId) -> Result<Arc<TypeInfo>, Error> {
+    pub fn get_type_info(&self, ty: TypeId) -> Result<Arc<TypeInfo>, Error> {
         // TODO: just insert that in the cache when creating the db
         match ty { // TODO: add missing core types
             type_ids::NEVER => Ok(Arc::new(TypeInfo {
@@ -275,18 +278,17 @@ impl<I: Io> Db<I> {
         }
     }
 
-    fn fetch_block(&mut self, block_num: u64, force_update: bool) -> Result<Arc<Block>, Error> {
-        const HEADER_SIZE: u64 = 2 + 6 + 8 + 8 + 64;
+    fn fetch_block(&mut self, block_num: u64, force_update: bool) -> Result<&Block, Error> {
         if force_update || !self.blocks_cache.contains_key(&block_num) {
             let data_start = HEADER_SIZE + self.block_count * 8 * 2;
             let block_start = data_start + (block_num * self.block_size);
             let mut buf = vec![0; self.block_size as usize];
             self.io.read(block_start, &mut buf)?;
-            self.blocks_cache.insert(block_num, Arc::new(Block {
+            self.blocks_cache.insert(block_num, Block {
                 buffer: buf,
-            }));
+            });
         }
-        Ok(Arc::clone(self.blocks_cache.get(&block_num).unwrap()))
+        Ok(self.blocks_cache.get(&block_num).unwrap())
     }
 
     pub fn iter_type<'a>(&'a mut self, ty: TypeId) -> TypeIterator<'a, I> {
@@ -305,6 +307,64 @@ impl<I: Io> Db<I> {
         types.sort_by_key(|x| x.0);
         types.dedup();
         types
+    }
+
+    fn find_free_block(&self) -> Option<usize> {
+        self.type_table.iter()
+            .enumerate()
+            .find(|(_, x)| x.0 == 0)
+            .map(|(i, _)| i)
+    }
+
+    fn write_type_table(&mut self) -> Result<(), Error> {
+        let mut tt = Vec::with_capacity(self.block_count as usize * 8);
+        for ty in &self.type_table {
+            let bytes = ty.0.to_be_bytes();
+            for byte in bytes {
+                tt.push(byte)
+            }
+        }
+        self.io.write(HEADER_SIZE, &tt)?;
+        self.io.write(HEADER_SIZE + tt.len() as u64, &tt)
+    }
+
+    fn allocate_block(&mut self, ty: TypeId) -> Result<(u64, u64), Error> {
+        if let Some(free_idx) = self.find_free_block() {
+            self.type_table[free_idx] = ty;
+            self.write_type_table()?;
+            self.blocks_cache.insert(free_idx as u64, Block { buffer: vec![0; self.block_size as usize] });
+            Ok((free_idx as u64, HEADER_SIZE + (self.block_count * 2 * 8) + (free_idx as u64 * self.block_size)))
+        } else {
+            return Err(Error::NoSpaceLeft);
+        }
+    }
+
+    pub fn write_object(&mut self, obj: DbObject) -> Result<(), Error> {
+        let (block_id, block_start) = self.allocate_block(obj.type_info.id)?; // TODO: look for blocks with some space left
+        let size = obj.size(&self);
+        let buff = &mut self.blocks_cache.get_mut(&block_id).unwrap().buffer;
+        for (i, byte) in 1u64.to_be_bytes().iter().enumerate() {
+            buff[i] = *byte;
+        }
+        let start = self.block_size as usize - size;
+        for (i, byte) in size.to_be_bytes().iter().enumerate() {
+            buff[8 + i] = *byte;
+        }
+        for (i, byte) in start.to_be_bytes().iter().enumerate() {
+            buff[16 + i] = *byte;
+        }
+        obj.value.write(&mut buff[start..])?;
+        self.io.write(block_start, buff)?;
+        if self.get_type_info(obj.type_info.id).is_err() {
+            let type_info = obj.type_info.into_runtime();
+            let type_info_obj = DbObject {
+                type_info: Arc::new(TypeInfo::type_info()),
+                value: Arc::clone(&type_info),
+            };
+            self.write_object(type_info_obj)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -338,7 +398,7 @@ impl<'a, I: Io> Iterator for TypeIterator<'a, I> {
     }
 }
 
-fn deser_value<I: Io>(data: &[u8], type_info: Arc<TypeInfo>, db: &mut Db<I>) -> Option<(DbObject, usize)> {
+fn deser_value<I: Io>(data: &[u8], type_info: Arc<TypeInfo>, db: &Db<I>) -> Option<(DbObject, usize)> {
     match type_info.definition {
         TypeDef::Never => panic!("Tried to construct the '!' type"),
         TypeDef::Unit => Some((type_info.construct(DbValue::Unit), 0)),
@@ -380,7 +440,7 @@ fn deser_value<I: Io>(data: &[u8], type_info: Arc<TypeInfo>, db: &mut Db<I>) -> 
             for _ in 0..len {
                 let (obj, size) = deser_value(&data[start..], Arc::clone(&inner_type), db)?;
                 start += size;
-                vec.push(obj);
+                vec.push(obj.value);
             }
             Some((type_info.construct(DbValue::Array(vec)), start))
         },
@@ -390,7 +450,7 @@ fn deser_value<I: Io>(data: &[u8], type_info: Arc<TypeInfo>, db: &mut Db<I>) -> 
             let (data, size) = deser_value(&data[8..], data_type, db)?;
             Some((type_info.construct(DbValue::Sum {
                 variant: tag,
-                data,
+                data: data.value,
             }), 8 + size))
         },
         TypeDef::Product { ref fields } => {
@@ -400,7 +460,7 @@ fn deser_value<I: Io>(data: &[u8], type_info: Arc<TypeInfo>, db: &mut Db<I>) -> 
                 let field_type = db.get_type_info(*field_type_id).unwrap();
                 let (field_val, size) = deser_value(&data[total_size..], field_type, db)?;
                 total_size += size;
-                field_values.push(field_val);
+                field_values.push(field_val.value);
             }
 
             Some((type_info.construct(DbValue::Product {
@@ -469,6 +529,9 @@ pub enum TypeDef {
     }
 }
 
+impl TypeDef {
+}
+
 #[derive(Debug)]
 pub struct TypeInfo {
     pub name: String,
@@ -483,6 +546,54 @@ impl TypeInfo {
             value: Arc::new(val),
         }
     }
+
+    fn type_info() -> Self {
+        TypeInfo {
+            name: "Core.Type".to_string(),
+            id: type_ids::TYPE,
+            definition: TypeDef::Product {
+                fields: vec![
+                    ("name".to_string(), type_ids::STR),
+                    ("id".to_string(), type_ids::TYPE_ID),
+                    ("definition".to_string(), type_ids::TYPEDEF),
+                ]
+            }
+        }
+    }
+
+    fn into_runtime(self: Arc<Self>) -> Arc<DbValue> {
+        Arc::new(DbValue::Product {
+            fields: vec![
+                Arc::new(DbValue::Array(self.name.bytes().map(|b| Arc::new(DbValue::U64(b as u64))).collect())),
+                Arc::new(DbValue::U64(self.id.0)),
+                Arc::new(DbValue::Sum {
+                    variant: match self.definition {
+                        TypeDef::Never => 0,
+                        TypeDef::Unit => 1,
+                        TypeDef::U8 => 2,
+                        TypeDef::U16 => 3,
+                        TypeDef::U32 => 4,
+                        TypeDef::U64 => 5,
+                        TypeDef::I8 => 6,
+                        TypeDef::I16 => 7,
+                        TypeDef::I32 => 8,
+                        TypeDef::I64 => 9,
+                        TypeDef::F32 => 10,
+                        TypeDef::F64 => 11,
+                        TypeDef::Array(_) => 12,
+                        TypeDef::Product { .. } => 13,
+                        TypeDef::Sum { .. } => 14,
+                    },
+                    data: Arc::new(match self.definition {
+                        TypeDef::Array(ref ty) => DbValue::U64(ty.0),
+                        TypeDef::Product { fields: ref _fields } => todo!(),
+                        TypeDef::Sum { variants: ref _variants } => todo!(),
+                        _ => DbValue::Unit,
+                    }),
+                }),
+            ],
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -490,13 +601,56 @@ pub enum DbValue {
     Unit,
     U64(u64),
     F64(f64),
-    Array(Vec<DbObject>),
+    Array(Vec<Arc<DbValue>>),
     Product {
-        fields: Vec<DbObject>,
+        fields: Vec<Arc<DbValue>>,
     },
     Sum {
         variant: u64,
-        data: DbObject,
+        data: Arc<DbValue>,
+    }
+}
+
+impl DbValue {
+    fn write(&self, buff: &mut [u8]) -> Result<u64, Error> {
+        match self {
+            &DbValue::Unit => Ok(0),
+            &DbValue::U64(x) => {
+                for (i, byte) in u64::to_be_bytes(x).iter().enumerate() {
+                    buff[i] = *byte;
+                }
+                Ok(8)
+            },
+            &DbValue::F64(x) => {
+                for (i, byte) in f64::to_be_bytes(x).iter().enumerate() {
+                    buff[i] = *byte;
+                }
+                Ok(8)
+            },
+            &DbValue::Array(ref arr) => {
+                for (i, byte) in u64::to_be_bytes(arr.len() as u64).iter().enumerate() {
+                    buff[i] = *byte;
+                }
+                let mut offset = 8;
+                for elem in arr {
+                    offset += elem.write(&mut buff[offset as usize..])?;
+                }
+                Ok(offset)
+            },
+            &DbValue::Product { ref fields } => {
+                let mut offset = 0;
+                for field in fields {
+                    offset += field.write(&mut buff[offset as usize..])?;
+                }
+                Ok(offset)
+            }
+            &DbValue::Sum { variant, ref data } => {
+                for (i, byte) in u64::to_be_bytes(variant).iter().enumerate() {
+                    buff[i] = *byte;
+                }
+                Ok(8 + data.write(&mut buff[8..])?)
+            }
+        }
     }
 }
 
@@ -504,6 +658,67 @@ pub enum DbValue {
 pub struct DbObject {
     pub type_info: Arc<TypeInfo>,
     pub value: Arc<DbValue>,
+}
+
+impl DbObject {
+    fn size<I: Io>(&self, db: &Db<I>) -> usize {
+        use TypeDef::*;
+
+        match self.type_info.definition {
+            Never | Unit => 0,
+            U8 | I8 => 1,
+            U16 | I16 => 2,
+            U32 | I32 | F32 => 4,
+            U64 | I64 | F64 => 8,
+            Array(id) => {
+                let inner_type = db.get_type_info(id).unwrap();
+                if let DbValue::Array(ref arr) = *self.value {
+                    if let Some(first) = arr.get(0) {
+                        8 + DbObject {
+                            type_info: inner_type,
+                            value: Arc::clone(first),
+                        }.size(db)
+                    } else {
+                        8
+                    }
+                } else {
+                    unreachable!()
+                }
+            },
+            Product { ref fields } => {
+                if let DbValue::Product { fields: ref vals } = *self.value {
+                    let vals = vals.iter();
+                    let mut total = 0;
+                    for ((_, id), val) in fields.iter().zip(vals) {
+                        let inner_type = db.get_type_info(*id).unwrap();
+                        let field_size = DbObject {
+                            type_info: inner_type,
+                            value: Arc::clone(val),
+                        }.size(db);
+                        total += field_size;
+                    }
+                    total
+                } else {
+                    unreachable!()
+                }
+            },
+            Sum { ref variants } => {
+                if let DbValue::Sum { variant, ref data } = *self.value {
+                    if let Some((_, id)) = variants.get(variant as usize) {
+                        let inner_type = db.get_type_info(*id).unwrap();
+                        DbObject {
+                            type_info: inner_type,
+                            value: Arc::clone(data),
+                        }.size(db)
+                    } else {
+                        panic!("Variant doesn't exist")
+                    }
+                } else {
+                    unreachable!()
+                }
+            }
+        }
+    }
 }
 
 #[cfg(not(feature = "no_std"))]
@@ -521,9 +736,10 @@ impl Io for std::fs::File {
         use std::io::{Write, Seek, SeekFrom};
 
         if self.stream_position().unwrap_or(0) != position {
-            self.seek(SeekFrom::Start(position)).map_err(|_| Error::ReadError)?;
+            self.seek(SeekFrom::Start(position)).map_err(|_| Error::WriteError)?;
         }
-        self.write_all(buffer).map_err(|_| Error::ReadError)
+        self.write_all(buffer).map_err(|_| Error::WriteError)?;
+        self.sync_all().map_err(|_| Error::WriteError)
     }
 }
 

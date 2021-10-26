@@ -4,4 +4,5 @@ members = [
     "adb",
     "adb-show",
     "adb-merge",
+    "adb-write-date",
 ]

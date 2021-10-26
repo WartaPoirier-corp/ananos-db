@@ -36,10 +36,15 @@ fn main() {
             }
         }
 
+        if ty.0 == 0 {
+            continue;
+        }
+
         let mut table = Table::new();
         table.set_format(style());
         let mut headers = false;
-        for obj in db.iter_type(ty) {
+        let objs: Vec<_> = db.iter_type(ty).collect();
+        for obj in objs {
             if !headers {
                 if let Some(filter) = ty_filter {
                     if filter != obj.type_info.name {
@@ -65,7 +70,7 @@ fn main() {
                 headers = true;
             }
 
-            match show(&obj) {
+            match show(&db, &obj.value, &obj.type_info) {
                 TableElem::Cell(s) => table.add_row(row!(s)),
                 TableElem::Row(r) => table.add_row(r),
             };
@@ -80,13 +85,15 @@ enum TableElem {
     Row(Row),
 }
 
-fn show(obj: &adb::DbObject) -> TableElem {
-    // dbg!(&obj.value);
-    match *obj.value {
+fn show(db: &adb::Db<std::fs::File>, value: &adb::DbValue, type_info: &adb::TypeInfo) -> TableElem {
+    match *value {
         adb::DbValue::U64(x) => TableElem::Cell(x.to_string()),
         adb::DbValue::Product { ref fields } => {
-            TableElem::Row(Row::new(fields.iter()
-                .map(|f| match show(f) {
+            TableElem::Row(Row::new(fields.iter().enumerate()
+                .map(|(i, f)| match show(db, f, &db.get_type_info(match type_info.definition {
+                    adb::TypeDef::Product { ref fields } => fields[i].1,
+                    _ => unreachable!()
+                }).unwrap()) {
                     TableElem::Cell(s) => cell!(s),
                     TableElem::Row(r) => {
                         let mut t = Table::init(vec![r]);
@@ -97,14 +104,17 @@ fn show(obj: &adb::DbObject) -> TableElem {
                 .collect()))
         },
         adb::DbValue::Sum { variant, ref data } => {
-            let variant_name = match obj.type_info.definition {
+            let variant_name = match type_info.definition {
                 adb::TypeDef::Sum { ref variants } => variants[variant as usize].0.clone(),
                 _ => {
                     println!("Warning: type and value are inconsistent");
                     variant.to_string()
                 }
             };
-            TableElem::Row(row!(variant_name, match show(data) {
+            TableElem::Row(row!(variant_name, match show(db, data, &db.get_type_info(match type_info.definition {
+                adb::TypeDef::Sum { ref variants } => variants[variant as usize].1,
+                _ => unreachable!(),
+            }).unwrap()) {
                 TableElem::Cell(c) => cell!(c),
                 TableElem::Row(r) => {
                     let mut t = Table::init(vec![r]);
@@ -115,40 +125,39 @@ fn show(obj: &adb::DbObject) -> TableElem {
         },
         adb::DbValue::Array(ref items) => {
             let items = items.iter();
-            if let Some(first) = items.clone().next() {
-                // TODO: real check for a string
-                let string = if first.type_info.id == adb::type_ids::U8 {
-                    String::from_utf8(items.clone().map(|i| match *i.value {
-                        adb::DbValue::U64(b) => b as u8,
-                        _ => panic!("This was not a string"),
-                    }).collect()).ok()
-                } else {
-                    None
-                };
-
-                if let Some(string) = string {
-                    TableElem::Cell(string)
-                } else {
-                    let mut inline = true;
-                    let content = items.map(|i| match show(i) {
-                        TableElem::Cell(c) => c,
-                        TableElem::Row(r) => {
-                            inline = false;
-                            let mut t = Table::init(vec![r]);
-                            t.set_format(style());
-                            t.to_string()
-                        },
-                    }).collect::<Vec<_>>();
-
-                    if inline {
-                        TableElem::Cell(format!("[ {} ]", content.join(", ")))
-                    } else {
-                        TableElem::Cell(format!("{}", content.join("")))
-                    }
-
-                }
+            let string = if type_info.id == adb::type_ids::STR {
+                String::from_utf8(items.clone().map(|i| match **i {
+                    adb::DbValue::U64(b) => b as u8,
+                    _ => panic!("This was not a string"),
+                }).collect()).ok()
             } else {
-                TableElem::Cell(String::new())
+                None
+            };
+
+            if let Some(string) = string {
+                TableElem::Cell(string)
+            } else {
+                let mut inline = true;
+                let inner_ty = db.get_type_info(match type_info.definition {
+                    adb::TypeDef::Array(ty) => ty,
+                    _ => unreachable!(),
+                }).unwrap();
+                let content = items.map(|i| match show(db, i, &inner_ty) {
+                    TableElem::Cell(c) => c,
+                    TableElem::Row(r) => {
+                        inline = false;
+                        let mut t = Table::init(vec![r]);
+                        t.set_format(style());
+                        t.to_string()
+                    },
+                }).collect::<Vec<_>>();
+
+                if inline {
+                    TableElem::Cell(format!("[ {} ]", content.join(", ")))
+                } else {
+                    TableElem::Cell(format!("{}", content.join("")))
+                }
+
             }
         },
         _ => todo!(),
