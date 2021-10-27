@@ -9,6 +9,7 @@ use alloc::vec;
 use alloc::string::String;
 use crate::alloc::borrow::ToOwned;
 use core::convert::TryInto;
+use alloc::string::ToString;
 
 #[derive(Debug)]
 pub enum Error {
