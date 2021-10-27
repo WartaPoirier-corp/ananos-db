@@ -90,7 +90,6 @@ impl<'a> Iterator for BlockIterator {
     }
 }
 
-#[derive(Debug)]
 pub struct Db<I: Io> {
     block_count: u64,
     block_size: u64,
@@ -98,6 +97,19 @@ pub struct Db<I: Io> {
     type_cache: BTreeMap<TypeId, Arc<TypeInfo>>,
     type_table: Vec<TypeId>,
     io: I,
+    logger: Option<fn(core::fmt::Arguments)>
+}
+
+impl<I: Io> core::fmt::Debug for Db<I> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Db")
+            .field("block_count", &self.block_count)
+            .field("block_size", &self.block_size)
+            .field("blocks_cache", &self.blocks_cache)
+            .field("type_cache", &self.type_cache)
+            .field("type_table", &self.type_table)
+            .finish()
+    }
 }
 
 const HEADER_SIZE: u64 = 2 + 6 + 8 + 8 + 64;
@@ -150,6 +162,7 @@ impl<I: Io> Db<I> {
             type_cache: BTreeMap::new(),
             type_table: block_types,
             io,
+            logger: None,
         };
         
         /* Layout of the Type type:
@@ -587,8 +600,17 @@ impl TypeInfo {
                     },
                     data: Arc::new(match self.definition {
                         TypeDef::Array(ref ty) => DbValue::U64(ty.0),
-                        TypeDef::Product { fields: ref _fields } => todo!(),
-                        TypeDef::Sum { variants: ref _variants } => todo!(),
+                        TypeDef::Product { fields: ref fields_or_variants } |
+                        TypeDef::Sum { variants: ref fields_or_variants } => DbValue::Array(
+                            fields_or_variants.iter()
+                                .map(|(name, id)| Arc::new(DbValue::Product {
+                                    fields: vec![
+                                        Arc::new(DbValue::Array(name.chars().map(|c| Arc::new(DbValue::U64(c as u64))).collect())),
+                                        Arc::new(DbValue::U64(id.0)),
+                                    ]
+                                }))
+                                .collect()
+                        ),
                         _ => DbValue::Unit,
                     }),
                 }),
