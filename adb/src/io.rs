@@ -2,13 +2,12 @@
 
 use crate::Error;
 
-mod memory;
 #[cfg(not(feature = "no_std"))]
 mod file;
+mod memory;
 
 /// Represents a backend for the database.
 pub trait Io: core::fmt::Debug {
-
     /// Reads some bytes.
     ///
     /// # Parameters
@@ -23,14 +22,14 @@ pub trait Io: core::fmt::Debug {
     /// `Ok(())` if everything went well, `Err(e)` if there was an error. `e` will
     /// usually be [`Error::ReadError`].
     fn read(&mut self, position: u64, buffer: &mut [u8]) -> Result<(), Error>;
-    
+
     /// Writes some bytes.
     ///
     /// # Parameters
     ///
     /// - `position`: the offset at which to write
     /// - `buffer`: a buffer containing the data to write. The backend should
-    ///    try to write as much as possible of this buffer, but may stop before 
+    ///    try to write as much as possible of this buffer, but may stop before
     ///    the end if there is no space left.
     ///
     /// # Returns

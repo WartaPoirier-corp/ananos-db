@@ -1,7 +1,7 @@
 //! Typing system for database objects.
 
-use alloc::sync::Arc;
 use crate::{type_ids, DbObject, DbValue};
+use alloc::sync::Arc;
 
 /// A type ID.
 ///
@@ -13,7 +13,6 @@ pub struct TypeId(pub u64);
 #[derive(Debug)]
 pub enum TypeDef {
     // TODO: maybe Unit and Never could be empty Products/Sums
-    
     /// This type is `!`.
     Never,
     /// This type is `()`.
@@ -52,7 +51,7 @@ pub enum TypeDef {
         /// A list of variants for this type. Each variant
         /// is defined by a name and a type for associated data (represented as type ID).
         variants: Vec<(String, TypeId)>,
-    }
+    },
 }
 
 /// Information about a type.
@@ -86,8 +85,8 @@ impl TypeInfo {
                     ("name".to_string(), type_ids::STR),
                     ("id".to_string(), type_ids::TYPE_ID),
                     ("definition".to_string(), type_ids::TYPEDEF),
-                ]
-            }
+                ],
+            },
         }
     }
 
@@ -96,7 +95,12 @@ impl TypeInfo {
     pub(crate) fn into_runtime(self: Arc<Self>) -> Arc<DbValue> {
         Arc::new(DbValue::Product {
             fields: vec![
-                Arc::new(DbValue::Array(self.name.bytes().map(|b| Arc::new(DbValue::U8(b))).collect())),
+                Arc::new(DbValue::Array(
+                    self.name
+                        .bytes()
+                        .map(|b| Arc::new(DbValue::U8(b)))
+                        .collect(),
+                )),
                 Arc::new(DbValue::U64(self.id.0)),
                 Arc::new(DbValue::Sum {
                     variant: match self.definition {
@@ -118,16 +122,28 @@ impl TypeInfo {
                     },
                     data: Arc::new(match self.definition {
                         TypeDef::Array(ref ty) => DbValue::U64(ty.0),
-                        TypeDef::Product { fields: ref fields_or_variants } |
-                        TypeDef::Sum { variants: ref fields_or_variants } => DbValue::Array(
-                            fields_or_variants.iter()
-                                .map(|(name, id)| Arc::new(DbValue::Product {
-                                    fields: vec![
-                                        Arc::new(DbValue::Array(name.as_bytes().iter().map(|b| Arc::new(DbValue::U8(*b))).collect())),
-                                        Arc::new(DbValue::U64(id.0)),
-                                    ]
-                                }))
-                                .collect()
+                        TypeDef::Product {
+                            fields: ref fields_or_variants,
+                        }
+                        | TypeDef::Sum {
+                            variants: ref fields_or_variants,
+                        } => DbValue::Array(
+                            fields_or_variants
+                                .iter()
+                                .map(|(name, id)| {
+                                    Arc::new(DbValue::Product {
+                                        fields: vec![
+                                            Arc::new(DbValue::Array(
+                                                name.as_bytes()
+                                                    .iter()
+                                                    .map(|b| Arc::new(DbValue::U8(*b)))
+                                                    .collect(),
+                                            )),
+                                            Arc::new(DbValue::U64(id.0)),
+                                        ],
+                                    })
+                                })
+                                .collect(),
                         ),
                         _ => DbValue::Unit,
                     }),
@@ -136,4 +152,3 @@ impl TypeInfo {
         })
     }
 }
-
