@@ -1,3 +1,7 @@
+//! Crate to read and write to ananOS databases.
+//!
+//! The main type is [`Db`].
+
 #![cfg_attr(feature = "no_std", no_std)]
 
 extern crate alloc;
@@ -7,31 +11,85 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use alloc::vec;
 use alloc::string::String;
-use crate::alloc::borrow::ToOwned;
+use alloc::borrow::ToOwned;
 use core::convert::TryInto;
 use alloc::string::ToString;
 
+/// Errors that can happen when manipulating a DB.
 #[derive(Debug)]
 pub enum Error {
+    /// This is not an ananOS DB.
     NotDb,
+    /// The version of the database is not supported by this
+    /// version of the `adb` crate.
     IncompatibleVersion,
+    /// There was an error while reading data from the [`Io`] backend.
     ReadError,
+    /// There was an error while writing data from the [`Io`] backend.
     WriteError,
+    /// The database needed information about a given type but couldn't find it.
     MissingTypeInfo(TypeId),
+    /// There is no more space in the database.
     NoSpaceLeft,
 }
 
+/// Represents a backend for the database.
 pub trait Io: core::fmt::Debug {
+
+    /// Reads some bytes.
+    ///
+    /// # Parameters
+    ///
+    /// - `position`: the offset at which to read
+    /// - `buffer`: a buffer in which to write the data that has been read.
+    ///    The backend should try to fill has much of it as possible, but may
+    ///    write less if there is not enough data until the end of the database.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if everything went well, `Err(e)` if there was an error. `e` will
+    /// usually be [`Error::ReadError`].
     fn read(&mut self, position: u64, buffer: &mut [u8]) -> Result<(), Error>;
     
+    /// Writes some bytes.
+    ///
+    /// # Parameters
+    ///
+    /// - `position`: the offset at which to write
+    /// - `buffer`: a buffer containing the data to write. The backend should
+    ///    try to write as much as possible of this buffer, but may stop before 
+    ///    the end if there is no space left.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if everything went well, `Err(e)` if there was an error. `e` will
+    /// usually be [`Error::WriteError`].
     fn write(&mut self, position: u64, buffer: &[u8]) -> Result<(), Error>;
 
+    /// Utility function to read a `u16` from the database.
+    ///
+    /// # Parameters
+    ///
+    /// - `position`: the offset at which the `u16` is.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(value)` if everything went well, `Err(e)` if there was an error.
     fn read_u16(&mut self, position: u64) -> Result<u16, Error> {
         let mut buf = [0; 2];
         self.read(position, &mut buf)?;
         Ok(u16::from_be_bytes(buf))
     }
 
+    /// Utility function to read a `u64` from the database.
+    ///
+    /// # Parameters
+    ///
+    /// - `position`: the offset at which the `u64` is.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(value)` if everything went well, `Err(e)` if there was an error.
     fn read_u64(&mut self, position: u64) -> Result<u64, Error> {
         let mut buf = [0; 8];
         self.read(position, &mut buf)?;
@@ -39,12 +97,30 @@ pub trait Io: core::fmt::Debug {
     }
 }
 
+/// Represent a block in the database.
+///
+/// ananOS databases are split into blocks. Each block contains
+/// objects from a given type. The type of a block is specified
+/// in the type table located at the start of the database.
+///
+/// A block starts with a `u64` indicating how many items this block contains (this number will be
+/// called *N*).
+/// Then, there is another `u64` indicating how much space is already occupied in this block,
+/// including both the actual objects, and the block header.
+/// After that comes *N* `u64`, each indicating an offset in the block at which an object can be
+/// found. Having this list of pointers allows to have objects of different sizes (some types,
+/// like arrays don't have a fixed size, so knowing the type doesn't give the size of all objects
+/// of this type).
+///
+/// Objects are written from the end of the block.
 #[derive(Debug)]
 pub struct Block {
+    /// The data of this block
     buffer: Vec<u8>,
 }
 
 impl Block {
+    /// Iterates over the objects in a block
     fn iter(&self) -> BlockIterator {
         BlockIterator {
             buffer: self.buffer.clone(),
@@ -54,10 +130,14 @@ impl Block {
     }
 }
 
+/// An iterator over objects of a [`Block`].
 #[derive(Debug, Clone)]
 struct BlockIterator {
+    /// The buffer of the block
     buffer: Vec<u8>,
+    /// The number of objects in the block
     item_count: u64,
+    /// The index of the current object
     current_item: usize,
 }
 
@@ -65,41 +145,102 @@ impl<'a> Iterator for BlockIterator {
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // end of the block
         if self.item_count <= (self.current_item as u64) {
             return None;
         }
 
+        // compute the pointer for the current object
         let pointer_start = 16 + (self.current_item * 8);
         let pointer_end = pointer_start + 8;
         let pointer = u64::from_be_bytes(self.buffer[pointer_start..pointer_end].try_into().unwrap());
 
+        // compute the size of the object
         let size = if self.current_item == 0 {
+            // for the first object, look how far from the end is the pointer
             self.buffer.len() - (pointer as usize)
         } else {
+            // for other objects, compute the pointer of the previous object,
+            // the size being the distance between the two
             let prev_pointer_start = pointer_start - 8;
             let prev_pointer_end = pointer_start;
             let prev_pointer = u64::from_be_bytes(self.buffer[prev_pointer_start..prev_pointer_end].try_into().unwrap());
             (prev_pointer - pointer) as usize
         };
 
+        // compute the end of the object
         let end = (pointer as usize) + size;
 
+        // iterate
         self.current_item += 1;
 
+        // return the slice containing the object
         Some(self.buffer[(pointer as usize)..end].to_owned())
     }
 }
 
+/// An ananOS database.
+///
+/// # Format
+///
+/// Independently from the backend (file, partition on a disk, in memory buffer, …), a database can
+/// be represented as a byte array. The bytes are laid out in a specific format that can be parsed
+/// into a [`Db`] with [`Db::read_from`].
+///
+/// There are two parts in the database: the header, and the blocks.
+///
+/// All numbers are encoded in big endian.
+///
+/// ## Header
+///
+/// The header starts with a magic number (`0xADB`), and 3 `u16` indicating the
+/// version number of the database (respectively major, minor and patch).
+/// Then comes two `u64`: one for the number of blocks (called *N*), and one for the size of
+/// a single block. Databases are divided in [`Block`]s. Each blocks stores object
+/// from a single type.
+///
+/// After there two numbers, there is a checksum of the database (not yet implemented),
+/// on 64 bytes.
+///
+/// After that comes two copy of the *type table*. This table contains *N* entries, that
+/// are `u64`. These numbers corresponds to the [`TypeId`] of the type stored in the corresponding
+/// block. For instance, if the type ID of `u8` is `0` and the type ID of `u16` is `1`, then a
+/// database that contains two blocks of `u8` followed by one block of `u16` would have the
+/// following type table:
+///
+/// ```
+/// 00 00 00 00 00 00 00 00
+/// 00 00 00 00 00 00 00 00
+/// 00 00 00 00 00 00 00 01
+/// ```
+///
+/// After the type table starts the actual blocks.
+///
+/// ## Blocks
+///
+/// For the format of a block, see [`Block`].
 pub struct Db<I: Io> {
+    /// The number of block in a database.
     block_count: u64,
+    /// The size of a single block.
     block_size: u64,
+    /// A cache of the blocks in the database.
     blocks_cache: BTreeMap<u64, Block>,
+    /// A cache of the types that are known.
     type_cache: BTreeMap<TypeId, Arc<TypeInfo>>,
+    /// The type table.
     type_table: Vec<TypeId>,
+    /// The I/O backend.
     io: I,
-    logger: Option<fn(core::fmt::Arguments)>
+    /// A logger.
+    ///
+    /// In some environment (for instance: OS kernels) `std::println!` and
+    /// other similar macros are not available, and this function is used to
+    /// provide logging.
+    logger: Option<fn(core::fmt::Arguments)> // TODO: use the log crate instead
 }
 
+// Custom impl because `Debug` is not implemented for function pointers
 impl<I: Io> core::fmt::Debug for Db<I> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Db")
@@ -112,9 +253,20 @@ impl<I: Io> core::fmt::Debug for Db<I> {
     }
 }
 
+// the size of the database header, without the type tables.
+// 2 -> magic number
+// 6 -> version
+// 8 -> block count
+// 8 -> block size
+// 64 -> checksum
 const HEADER_SIZE: u64 = 2 + 6 + 8 + 8 + 64;
 
 impl<I: Io> Db<I> {
+    /// Initializes a database.
+    ///
+    /// # Parameters
+    ///
+    /// - `io`: the I/O backend from which to read and write data.
     pub fn read_from(mut io: I) -> Result<Self, Error> {
         let magic = io.read_u16(0)?;
         if magic != 0xADB {
@@ -216,6 +368,15 @@ impl<I: Io> Db<I> {
         Ok(db)
     }
 
+    /// Returns type information about a given type.
+    ///
+    /// # Parameters
+    ///
+    /// - `ty`: the ID of the requested type
+    ///
+    /// # Returns
+    ///
+    /// `Ok` if the type was known, `Err(Error::MissingTypeInfo)` if it was not.
     pub fn get_type_info(&self, ty: TypeId) -> Result<Arc<TypeInfo>, Error> {
         // TODO: just insert that in the cache when creating the db
         match ty { // TODO: add missing core types
@@ -302,6 +463,10 @@ impl<I: Io> Db<I> {
         }
     }
 
+    /// Fetches a block from the backend.
+    ///
+    /// If the block is present in the cache and `force_update` is false,
+    /// it will not be re-read.
     fn fetch_block(&mut self, block_num: u64, force_update: bool) -> Result<&Block, Error> {
         if force_update || !self.blocks_cache.contains_key(&block_num) {
             let data_start = HEADER_SIZE + self.block_count * 8 * 2;
@@ -315,6 +480,7 @@ impl<I: Io> Db<I> {
         Ok(self.blocks_cache.get(&block_num).unwrap())
     }
 
+    /// Iterates over all the objects of a given type.
     pub fn iter_type<'a>(&'a mut self, ty: TypeId) -> TypeIterator<'a, I> {
         let type_info = self.get_type_info(ty).unwrap();
         let blocks = self.type_table.iter().enumerate().filter(|(_, x)| **x == ty).map(|(i, _)| i as u64).collect();
@@ -326,6 +492,7 @@ impl<I: Io> Db<I> {
         }
     }
 
+    /// List all the type IDs that are present in the database.
     pub fn all_type_ids(&self) -> Vec<TypeId> {
         let mut types = self.type_table.clone();
         types.sort_by_key(|x| x.0);
@@ -333,6 +500,11 @@ impl<I: Io> Db<I> {
         types
     }
 
+    /// Finds a free block in the database.
+    ///
+    /// A free block is a block that currently stores the never type (ID `0`).
+    ///
+    /// If no free block is available, `None` is returned.
     fn find_free_block(&self) -> Option<usize> {
         self.type_table.iter()
             .enumerate()
@@ -340,6 +512,7 @@ impl<I: Io> Db<I> {
             .map(|(i, _)| i)
     }
 
+    /// Persists the type table.
     fn write_type_table(&mut self) -> Result<(), Error> {
         let mut tt = Vec::with_capacity(self.block_count as usize * 8);
         for ty in &self.type_table {
@@ -352,6 +525,11 @@ impl<I: Io> Db<I> {
         self.io.write(HEADER_SIZE + tt.len() as u64, &tt)
     }
 
+    /// Tries to find a free block and assigns it a type.
+    ///
+    /// # Returns
+    ///
+    /// `Ok((block_index, block_start_offset))` if everything went well.
     fn allocate_block(&mut self, ty: TypeId) -> Result<(u64, u64), Error> {
         if let Some(free_idx) = self.find_free_block() {
             self.type_table[free_idx] = ty;
@@ -363,25 +541,35 @@ impl<I: Io> Db<I> {
         }
     }
 
+    /// Persists a [`DbObject`].
     pub fn write_object(&mut self, obj: DbObject) -> Result<(), Error> {
-        self.log(format_args!("Writing a {}", obj.type_info.name));
-        let (block_id, block_start) = self.allocate_block(obj.type_info.id)?; // TODO: look for blocks with some space left
         let size = obj.size(&self);
-        self.log(format_args!("Size of the object {}", size));
-        let start = self.block_size as usize - size;
-        self.log(format_args!("Start of buffer {}", start));
+
+        // allocate a new block for the object
+        let (block_id, block_start) = self.allocate_block(obj.type_info.id)?; // TODO: look for blocks with some space left
         let buff = &mut self.blocks_cache.get_mut(&block_id).unwrap().buffer;
+
+        // write a 1 at the start of the block, since it will only contain one object
         for (i, byte) in 1u64.to_be_bytes().iter().enumerate() {
             buff[i] = *byte;
         }
+
+        // write the size occupied by the single object of the block
         for (i, byte) in size.to_be_bytes().iter().enumerate() {
             buff[8 + i] = *byte;
         }
+
+        // write the pointer to the object
+        let start = self.block_size as usize - size;
         for (i, byte) in start.to_be_bytes().iter().enumerate() {
             buff[16 + i] = *byte;
         }
-        obj.value.write(self.logger.clone().unwrap_or(|_| {}), &mut buff[start..])?;
+
+        // write the value of the object at the end of the block
+        obj.value.write(&mut buff[start..])?;
         self.io.write(block_start, buff)?;
+
+        // if the type of the object is not yet in the database itself, write it too
         if self.get_type_info(obj.type_info.id).is_err() {
             self.type_cache.insert(obj.type_info.id, Arc::clone(&obj.type_info));
             let type_info = obj.type_info.into_runtime();
@@ -395,10 +583,12 @@ impl<I: Io> Db<I> {
         Ok(())
     }
 
+    /// Defines the logger to use.
     pub fn set_logger(&mut self, logger: fn(core::fmt::Arguments)) {
         self.logger = Some(logger);
     }
 
+    /// Logs a message using the logger, if it is defined.
     fn log(&self, args: core::fmt::Arguments) {
         if let Some(log) = self.logger {
             log(args);
@@ -406,6 +596,7 @@ impl<I: Io> Db<I> {
     }
 }
 
+/// Iterator over all the object of a given type.
 #[derive(Debug)]
 pub struct TypeIterator<'a, I: Io> {
     db: &'a mut Db<I>,
@@ -415,6 +606,7 @@ pub struct TypeIterator<'a, I: Io> {
 }
 
 impl<'a, I: Io> TypeIterator<'a, I> {
+    /// Information about the type of this iterator.
     pub fn ty(&self) -> Arc<TypeInfo> {
         Arc::clone(&self.type_info)
     }
@@ -442,6 +634,22 @@ impl<'a, I: Io> Iterator for TypeIterator<'a, I> {
     }
 }
 
+/// Reads an object from a buffer.
+///
+/// # Parameters
+///
+/// - `data`: the buffer containing the object
+/// - `type_info`: the type of the object
+/// - `db`: a reference to the database, required to query more type information
+///
+/// # Returns
+///
+/// `Some((object, number_of_bytes))` if everything went well. `number_of_bytes` is the number
+/// of bytes that were read from the buffer to deserialize this object.
+///
+/// # Panics
+///
+/// This function panics if a value of type `!` (never) is built.
 fn deser_value<I: Io>(data: &[u8], type_info: Arc<TypeInfo>, db: &Db<I>) -> Option<(DbObject, usize)> {
     match type_info.definition {
         TypeDef::Never => panic!("Tried to construct the '!' type"),
@@ -514,6 +722,7 @@ fn deser_value<I: Io>(data: &[u8], type_info: Arc<TypeInfo>, db: &Db<I>) -> Opti
     }
 }
 
+/// Reads an UTF-8 encoded string from a buffer.
 fn read_string(buffer: &[u8]) -> String {
     let len = u64::from_be_bytes(buffer[0..8].try_into().unwrap()) as usize;
     let buf = &buffer[8..(8 + len)];
@@ -521,9 +730,13 @@ fn read_string(buffer: &[u8]) -> String {
     string
 }
 
+/// A type ID.
+///
+/// Each type in a database has a single type ID.
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug)]
 pub struct TypeId(pub u64);
 
+/// A collection of predefined type IDs.
 pub mod type_ids {
     use super::TypeId;
 
@@ -549,41 +762,66 @@ pub mod type_ids {
     pub const FIELD_ARRAY: TypeId = TypeId(0x13);
 }
 
+/// Represents how a type is defined.
 #[derive(Debug)]
 pub enum TypeDef {
     // TODO: maybe Unit and Never could be empty Products/Sums
+    
+    /// This type is `!`.
     Never,
+    /// This type is `()`.
     Unit,
+    /// This type is `u8`.
     U8,
+    /// This type is `u16`.
     U16,
+    /// This type is `u32`.
     U32,
+    /// This type is `u64`.
     U64,
+    /// This type is `i8`.
     I8,
+    /// This type is `i16`.
     I16,
+    /// This type is `i32`.
     I32,
+    /// This type is `i64`.
     I64,
+    /// This type is `f32`.
     F32,
+    /// This type is `f64`.
     F64,
+    /// This type is a array. The `TypeId` is the type ID
+    /// of the elements of the array.
     Array(TypeId),
+    /// This type is a product type (aka tuple or struct).
     Product {
+        /// A list of fields for this type. Each field
+        /// is defined by a name and a type (represented as type ID).
         fields: Vec<(String, TypeId)>,
     },
+    /// This type is a sum type (aka enum).
     Sum {
+        /// A list of variants for this type. Each variant
+        /// is defined by a name and a type for associated data (represented as type ID).
         variants: Vec<(String, TypeId)>,
     }
 }
 
-impl TypeDef {
-}
-
+/// Information about a type.
 #[derive(Debug)]
 pub struct TypeInfo {
+    /// The name of the type.
     pub name: String,
+    /// The ID of the type.
     pub id: TypeId,
+    /// The definition of the type.
     pub definition: TypeDef,
 }
 
 impl TypeInfo {
+    /// Creates a [`DbObject`] by associating this type with a value (that should be
+    /// of this type).
     fn construct(self: Arc<Self>, val: DbValue) -> DbObject {
         DbObject {
             type_info: self,
@@ -591,6 +829,7 @@ impl TypeInfo {
         }
     }
 
+    /// Returns `TypeInfo` about `TypeInfo`.
     fn type_info() -> Self {
         TypeInfo {
             name: "Core.Type".to_string(),
@@ -605,6 +844,8 @@ impl TypeInfo {
         }
     }
 
+    /// Transforms a `TypeInfo` into a runtime value, that can then be written
+    /// to the database (for instance).
     fn into_runtime(self: Arc<Self>) -> Arc<DbValue> {
         Arc::new(DbValue::Product {
             fields: vec![
@@ -649,6 +890,7 @@ impl TypeInfo {
     }
 }
 
+/// A value in the database.
 #[derive(Debug)]
 pub enum DbValue {
     Unit,
@@ -666,16 +908,15 @@ pub enum DbValue {
 }
 
 impl DbValue {
-    fn write(&self, log: fn(core::fmt::Arguments), buff: &mut [u8]) -> Result<u64, Error> {
+    /// Writes the value to a buffer.
+    fn write(&self, buff: &mut [u8]) -> Result<u64, Error> {
         match self {
             &DbValue::Unit => Ok(0),
             &DbValue::U8(x) => {
-                log(format_args!("writing byte {}", x));
                 buff[0] = x;
                 Ok(1)
             },
             &DbValue::U64(x) => {
-                log(format_args!("writing u64 {}", x));
                 for (i, byte) in u64::to_be_bytes(x).iter().enumerate() {
                     buff[i] = *byte;
                 }
@@ -693,38 +934,42 @@ impl DbValue {
                 }
                 let mut offset = 8;
                 for elem in arr {
-                    offset += elem.write(log, &mut buff[offset as usize..])?;
+                    offset += elem.write(&mut buff[offset as usize..])?;
                 }
-                log(format_args!("wrote array of size {}", offset));
                 Ok(offset)
             },
             &DbValue::Product { ref fields } => {
                 let mut offset = 0;
                 for field in fields {
-                    offset += field.write(log, &mut buff[offset as usize..])?;
+                    offset += field.write(&mut buff[offset as usize..])?;
                 }
-                log(format_args!("wrote product {}", offset));
                 Ok(offset)
             }
             &DbValue::Sum { variant, ref data } => {
                 for (i, byte) in u64::to_be_bytes(variant).iter().enumerate() {
                     buff[i] = *byte;
                 }
-                let res = 8 + data.write(log, &mut buff[8..])?;
-                log(format_args!("wrote sum {}", res));
+                let res = 8 + data.write(&mut buff[8..])?;
                 Ok(res)
             }
         }
     }
 }
 
+/// An object of the database.
+///
+/// An object is composed of [`DbValue`] and of information
+/// about the type of this value (in a [`TypeInfo`]).
 #[derive(Debug)]
 pub struct DbObject {
+    /// Type of the object.
     pub type_info: Arc<TypeInfo>,
+    /// Value of the object.
     pub value: Arc<DbValue>,
 }
 
 impl DbObject {
+    /// Computes the size of an object.
     fn size<I: Io>(&self, db: &Db<I>) -> usize {
         use TypeDef::*;
 
