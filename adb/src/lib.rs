@@ -181,12 +181,6 @@ pub struct Db<I: Io> {
     type_table: Vec<TypeId>,
     /// The I/O backend.
     io: I,
-    /// A logger.
-    ///
-    /// In some environment (for instance: OS kernels) `std::println!` and
-    /// other similar macros are not available, and this function is used to
-    /// provide logging.
-    logger: Option<fn(core::fmt::Arguments)>, // TODO: use the log crate instead
 }
 
 // Custom impl because `Debug` is not implemented for function pointers
@@ -263,7 +257,6 @@ impl<I: Io> Db<I> {
             type_cache: BTreeMap::new(),
             type_table: block_types,
             io,
-            logger: None,
         };
 
         /* Layout of the Type type:
@@ -551,19 +544,6 @@ impl<I: Io> Db<I> {
         }
 
         Ok(())
-    }
-
-    /// Defines the logger to use.
-    pub fn set_logger(&mut self, logger: fn(core::fmt::Arguments)) {
-        self.logger = Some(logger);
-    }
-
-    /// Logs a message using the logger, if it is defined.
-    #[allow(dead_code)]
-    fn log(&self, args: core::fmt::Arguments) {
-        if let Some(log) = self.logger {
-            log(args);
-        }
     }
 }
 

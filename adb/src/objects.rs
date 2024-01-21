@@ -2,6 +2,7 @@
 
 use crate::{Db, Error, Io, TypeInfo};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 /// A value in the database.
 #[derive(Debug)]

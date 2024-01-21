@@ -2,6 +2,9 @@
 
 use crate::{type_ids, DbObject, DbValue};
 use alloc::sync::Arc;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use alloc::vec;
 
 /// A type ID.
 ///

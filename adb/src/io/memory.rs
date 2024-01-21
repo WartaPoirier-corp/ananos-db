@@ -1,6 +1,7 @@
 //! Various in-memory backends.
 
 use crate::{Error, Io};
+use alloc::vec::Vec;
 
 impl Io for [u8] {
     fn read(&mut self, position: u64, buffer: &mut [u8]) -> Result<(), Error> {
